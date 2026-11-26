@@ -8,12 +8,34 @@ services:
       - plugins:/opt/Lavalink/plugins
     restart: "no"
 
-  lavalink:
+  soundcloud-plugin:
+    image: alpine:3.22
+    volumes:
+      - plugins:/plugins
+    working_dir: /plugins
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        jar=soundy-plugin-1.1.1.jar
+        digest=1fd0c2f41f214ffb8b33fe744584b1efbbe14edbd31ef7c4cb73f7fd4df4f5ac
+        if echo "$digest  $jar" | sha256sum -c -s 2>/dev/null; then exit 0; fi
+        wget -O "$jar.tmp" "https://github.com/lpaiu-cs/soundy-plugin/releases/download/v1.1.1/$jar"
+        echo "$digest  $jar.tmp" | sha256sum -c -
+        chmod 644 "$jar.tmp"
+        mv "$jar.tmp" "$jar"
     depends_on:
       plugin-permissions:
         condition: service_completed_successfully
+    restart: "no"
+
+  lavalink:
+    depends_on:
+      soundcloud-plugin:
+        condition: service_completed_successfully
     image: ghcr.io/lavalink-devs/lavalink:4.2.2
     environment:
+      LAVALINK_SERVER_SOURCES_SOUNDCLOUD: "false"
+      PLUGINS_SOUNDY_ENABLED: "true"
       LAVALINK_SERVER_PASSWORD: ${LAVALINK_PASSWORD:?Set LAVALINK_PASSWORD in .env}
     ports:
       - "127.0.0.1:2333:2333"
