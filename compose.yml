@@ -1,5 +1,17 @@
 services:
+  plugin-permissions:
+    image: ghcr.io/lavalink-devs/lavalink:4.2.2
+    user: "0:0"
+    entrypoint: ["/bin/chown", "-R", "lavalink", "/opt/Lavalink/plugins"]
+    command: []
+    volumes:
+      - plugins:/opt/Lavalink/plugins
+    restart: "no"
+
   lavalink:
+    depends_on:
+      plugin-permissions:
+        condition: service_completed_successfully
     image: ghcr.io/lavalink-devs/lavalink:4.2.2
     environment:
       LAVALINK_SERVER_PASSWORD: ${LAVALINK_PASSWORD:?Set LAVALINK_PASSWORD in .env}
