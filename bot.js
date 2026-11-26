@@ -1,10 +1,11 @@
+import { randomUUID } from 'node:crypto'
 import { AudioPlayerStatus } from '@discordjs/voice'
 import {
   ApplicationIntegrationType, ButtonStyle, Client, ComponentType, Events, GatewayIntentBits,
   InteractionContextType, MessageFlags, PermissionsBitField, Routes, escapeMarkdown
 } from 'discord.js'
 import { connectVoice, makePlayer, streamResource } from './audio.js'
-import { fillTrackDetails, resolveTracks, soundcloudMatch } from './media.js'
+import { fillTrackDetails, resolveTracks, searchChoices } from './media.js'
 import { banner, getCover } from './banner.js'
 
 const token = process.env.DISCORD_TOKEN
@@ -173,15 +174,11 @@ async function startTrack(player, track) {
 function finished(player, resource, failed) {
   void serial(player.guild.id, async () => {
     if (players.get(player.guild.id) !== player || player.stream?.resource !== resource) return
-    const current = player.current
     const t = translations[player.language]
-    if (failed && !current.mirror && /(^|\.)(youtube\.com|youtu\.be)$/.test(new URL(current.playUrl).hostname)) {
-      const matches = await soundcloudMatch(current.info.title, current.info.author, current.info.uri, current.artwork).catch(() => [])
-      if (matches.length) {
-        await startTrack(player, matches[0])
-        await refresh(player)
-        return
-      }
+    const track = player.current
+    if (failed && track.request && !track.fallbackOffered) {
+      track.fallbackOffered = true
+      void offerFallback(track).catch(error => console.error('Recording choices:', error.message.split('\n')[0]))
     }
     await advance(player, failed ? t.failed : t.ended)
   }).catch(error => console.error('Playback:', error.message.split('\n')[0]))
@@ -217,7 +214,7 @@ function resolveCommand(interaction) {
   return {}
 }
 
-async function handle(interaction, action, language) {
+async function handle(interaction, action, language, selected) {
   const player = players.get(interaction.guildId)
   const t = translations[language]
   const memberVoice = interaction.guild.voiceStates.cache.get(interaction.user.id)?.channel
@@ -229,12 +226,19 @@ async function handle(interaction, action, language) {
     const self = interaction.guild.members.me
     const required = PermissionsBitField.Flags.Connect | PermissionsBitField.Flags.Speak
     if (memberVoice.type !== 2 || !self || !memberVoice.permissionsFor(self)?.has(required)) return t.permissions
-    const query = interaction.options.getString(language === 'ar' ? 'بحث' : 'query', true).trim()
-    if (!query) return t.noMatch
     if ((player?.queue.length || 0) >= maxQueue) return t.full
 
-    const tracks = await resolveTracks(query)
+    const result = selected ? { tracks: [selected] } : await resolveTracks(
+      interaction.options.getString(language === 'ar' ? 'بحث' : 'query', true).trim()
+    )
+    const tracks = result.tracks
+    if (result.choices && tracks.length) return choiceMenu(interaction, result, language)
     if (!tracks.length) return t.noMatch
+    for (const track of tracks) {
+      if (/(^|\.)(youtube\.com|youtu\.be)$/.test(new URL(track.playUrl).hostname)) {
+        track.request = { interaction, language }
+      }
+    }
     if (player) {
       const added = tracks.slice(0, maxQueue - player.queue.length)
       player.queue.push(...added)
@@ -297,13 +301,60 @@ async function handle(interaction, action, language) {
   return t.failed
 }
 
+const pending = new Map()
+
+async function offerFallback(track) {
+  const { interaction, language } = track.request
+  if (Date.now() - interaction.createdTimestamp > 14 * 60 * 1000) return
+  const result = await searchChoices(track.info.title, track.info.author, 'YouTube')
+  if (!result.tracks.length) return
+  await interaction.followUp({ ...choiceMenu(interaction, result, language), flags: MessageFlags.Ephemeral, allowedMentions: quiet })
+}
+
+function choiceMenu(interaction, { source, tracks }, language) {
+  const key = randomUUID()
+  pending.set(key, { user: interaction.user.id, guild: interaction.guildId, language, tracks })
+  setTimeout(() => pending.delete(key), 120000).unref()
+  const ar = language === 'ar'
+  const intro = source === 'SoundCloud' ? '' : (ar ? `الرابط من ${source}. ` : `Link from ${source}. `)
+  return {
+    content: intro + (ar ? 'اختاري التسجيل اللي تبينه من نتائج SoundCloud خلال دقيقتين.' : 'Choose a SoundCloud recording within two minutes.'),
+    components: [{ type: ComponentType.ActionRow, components: [{
+      type: ComponentType.StringSelect, custom_id: 'recording:' + key,
+      placeholder: ar ? 'اختيار الأغنية' : 'Choose recording',
+      options: tracks.map((track, index) => {
+        const seconds = Math.floor(track.duration || 0)
+        const length = seconds ? ` · ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}` : ''
+        return { value: String(index), label: track.info.title.slice(0, 100),
+          description: (track.uploader || track.info.author || 'SoundCloud').slice(0, 85) + length }
+      })
+    }] }]
+  }
+}
+
 client.on(Events.InteractionCreate, async interaction => {
-  const { action, language } = resolveCommand(interaction)
-  if (!action || !interaction.inCachedGuild()) return
+  if (!interaction.inCachedGuild()) return
+  const pick = interaction.isStringSelectMenu() && interaction.customId.startsWith('recording:')
+  const key = pick ? interaction.customId.slice('recording:'.length) : ''
+  const entry = pick ? pending.get(key) : null
+  const { action, language } = pick ? { action: 'play', language: entry?.language || 'ar' } : resolveCommand(interaction)
+  if (!action) return
   try {
-    await interaction.deferReply({ flags: MessageFlags.Ephemeral })
-    const content = await serial(interaction.guildId, () => handle(interaction, action, language))
-    await interaction.editReply({ content, allowedMentions: quiet })
+    let selected
+    if (pick) {
+      selected = entry?.tracks[Number(interaction.values[0])]
+      if (!selected || entry.user !== interaction.user.id || entry.guild !== interaction.guildId) {
+        await interaction.reply({ content: 'انتهى الاختيار. استخدم /شغل من جديد. · Use /play again.', flags: MessageFlags.Ephemeral })
+        return
+      }
+      pending.delete(key)
+      await interaction.deferUpdate()
+    } else {
+      await interaction.deferReply({ flags: MessageFlags.Ephemeral })
+    }
+    const reply = await serial(interaction.guildId, () => handle(interaction, action, language, selected))
+    const payload = typeof reply === 'string' ? { content: reply, components: [] } : reply
+    await interaction.editReply({ ...payload, allowedMentions: quiet })
   } catch (error) {
     console.error('Command:', error.message.split('\n')[0])
     if (interaction.deferred) await interaction.editReply(translations[language].failed).catch(() => {})

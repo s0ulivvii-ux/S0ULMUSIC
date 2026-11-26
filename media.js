@@ -23,6 +23,8 @@ function trackFrom(data) {
   return {
     needsDetails: data._type === 'url' || data._type === 'url_transparent',
     playUrl: url, info: { uri: url, title: data.track || data.title, author: data.artist || data.uploader || data.channel || '' },
+    uploader: data.uploader || data.channel || '',
+    duration: Number(data.duration) || 0,
     artistUrl: data.uploader_url || data.channel_url,
     artwork: data.thumbnail || data.thumbnails?.at(-1)?.url
   }
@@ -43,31 +45,35 @@ export async function fillTrackDetails(track) {
   }
 }
 
-function matches(candidate, title, artist) {
+const versionWords = /\b(remix|cover|sped up|slowed|reverb|instrumental|karaoke|live|edit|nightcore|bootleg)\b|ريمكس|مسرع|مبط[أئ]|كاريوكي|حفلة/gu
+
+function rank(track, title, artist) {
   const wanted = normalize(title)
-  const found = normalize(candidate.info.title)
-  const by = normalize(artist?.replace(/ - Topic$/i, ''))
-  const owner = normalize(candidate.info.author)
-  if (!wanted || !found) return false
-  if (!by) return found === wanted
-  const combined = ' ' + found + ' '
-  const requested = ' ' + wanted + ' '
-  const titleMatches = found === wanted || found === by + ' ' + wanted || found === wanted + ' ' + by ||
-    (requested === ' ' + owner + ' ' + found + ' ')
-  return titleMatches && (owner === by || combined.includes(' ' + by + ' ') || requested.includes(' ' + owner + ' ') && owner)
+  const name = normalize(track.info.title)
+  const credit = normalize(artist)
+  const owner = normalize(track.uploader || track.info.author)
+  const words = new Set(wanted.split(' ').filter(Boolean))
+  const found = new Set((name + ' ' + owner).split(' '))
+  let score = [...words].filter(word => found.has(word)).length * 2
+  if (name === wanted) score += 12
+  if (credit && owner === credit) score += 12
+  if (owner && wanted.includes(owner)) score += 4
+  const modifiers = name.match(versionWords) || []
+  if (modifiers.some(word => !words.has(word) && !wanted.includes(word))) score -= 30
+  return score
 }
 
-export async function soundcloudMatch(title, artist, original, artwork) {
-  const query = [artist, title].filter(Boolean).join(' ').slice(0, 220)
-  const data = await lookup('scsearch8:' + query, true)
-  const candidates = (data.entries || []).filter(Boolean).map(trackFrom).filter(Boolean)
-  const matched = candidates.filter(track => matches(track, title, artist))
-  if (!matched.length || (!artist && new Set(matched.map(t => normalize(t.info.author))).size > 1)) return []
-  const chosen = matched[0]
-  chosen.info.uri = original
-  chosen.artwork = artwork || chosen.artwork
-  chosen.mirror = true
-  return [chosen]
+export async function searchChoices(title, artist = '', source = 'SoundCloud') {
+  const by = (artist === 'Spotify' ? '' : artist || '').replace(/ - Topic$/i, '').trim()
+  const term = normalize(title).includes(normalize(by)) ? title : [by, title].join(' ')
+  const result = await lookup('scsearch12:' + term.slice(0, 220), true)
+  const unique = new Map()
+  for (const item of result.entries || []) {
+    const track = item && trackFrom(item)
+    if (track && track.info.title && !unique.has(track.playUrl)) unique.set(track.playUrl, track)
+  }
+  const tracks = [...unique.values()].sort((a, b) => rank(b, title, by) - rank(a, title, by)).slice(0, 5)
+  return { choices: true, source, tracks }
 }
 
 async function json(url) {
@@ -79,19 +85,17 @@ async function json(url) {
 async function singleMirror(url, type) {
   if (type === 'apple') {
     const id = url.searchParams.get('i') || /\/song\/[^/]+\/(\d+)/.exec(url.pathname)?.[1]
-    if (!id || !/^\d+$/.test(id)) return []
+    if (!id || !/^\d+$/.test(id)) return { tracks: [] }
     const region = url.pathname.split('/')[1]
     const data = await json('https://itunes.apple.com/lookup?' + new URLSearchParams({ id, country: /^[a-z]{2}$/i.test(region) ? region : 'US' }))
     const track = data.results?.find(item => String(item.trackId) === id)
-    if (!track) return []
-    const found = await soundcloudMatch(track.trackName, track.artistName, url.href, track.artworkUrl100?.replace('100x100', '300x300'))
-    if (found[0]) found[0].artistUrl = track.artistViewUrl
-    return found
+    if (!track) return { tracks: [] }
+    return searchChoices(track.trackName, track.artistName, 'Apple Music')
   }
   const endpoint = type === 'spotify' ? 'https://open.spotify.com/oembed?' : 'https://www.youtube.com/oembed?'
   const meta = await json(endpoint + new URLSearchParams({ url: url.href, format: 'json' }))
-  if (!meta.title) return []
-  return soundcloudMatch(meta.title, meta.author_name, url.href, meta.thumbnail_url)
+  if (!meta.title) return { tracks: [] }
+  return searchChoices(meta.title, meta.author_name, type === 'spotify' ? 'Spotify' : 'YouTube')
 }
 
 async function spotifyUrl(url) {
@@ -107,24 +111,25 @@ async function spotifyUrl(url) {
 
 export async function resolveTracks(input) {
   if (!/^https?:\/\//i.test(input)) {
-    if (/^[a-z][\w+.-]*:/i.test(input)) return []
-    const result = await lookup('scsearch1:' + input, true)
-    return (result.entries || []).filter(Boolean).map(trackFrom).filter(Boolean)
+    if (/^[a-z][\w+.-]*:/i.test(input)) return { tracks: [] }
+    return searchChoices(input)
   }
   const url = new URL(input)
-  if (url.port || url.username || url.password) return []
+  if (url.port || url.username || url.password) return { tracks: [] }
   if (['open.spotify.com', 'spotify.link', 'spotify.app.link'].includes(url.hostname)) {
     const canonical = await spotifyUrl(url)
-    return canonical ? singleMirror(canonical, 'spotify') : []
+    return canonical ? singleMirror(canonical, 'spotify') : { tracks: [] }
   }
   if (url.hostname === 'music.apple.com') return singleMirror(url, 'apple')
-  if (!directHosts.some(h => hostIs(url.hostname, h))) return []
+  if (!directHosts.some(h => hostIs(url.hostname, h))) return { tracks: [] }
   const youtube = hostIs(url.hostname, 'youtube.com') || url.hostname === 'youtu.be'
   try {
     // Flat playlists retain individual track URLs. Single URLs return full metadata.
     const result = await lookup(url.href, true)
     const items = result.entries || [result]
-    return items.filter(Boolean).map(trackFrom).filter(Boolean)
+    const tracks = items.filter(Boolean).map(trackFrom).filter(Boolean)
+    if (!tracks.length && youtube && !result.entries) return singleMirror(url, 'youtube')
+    return { tracks }
   } catch (error) {
     if (!youtube || url.pathname === '/playlist') throw error
     return singleMirror(url, 'youtube')
